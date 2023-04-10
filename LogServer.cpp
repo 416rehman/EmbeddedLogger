@@ -6,6 +6,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <limits>
+#include <vector>
 #include "Logger.h"
 
 /**
@@ -46,15 +48,18 @@ take any content from recvfrom() and write to the server log file.
 // Global variable to control the flow of the program.
 bool g_isRunning = true;
 // File descriptor for the UDP socket
-int g_serverFd;
+int g_UDPSocketFD;
 // Socket address struct for this server
-struct sockaddr_in g_addr;
+struct sockaddr_in g_serverAddr, g_remoteAddr;
 // Mutex for shared resources
 pthread_mutex_t g_mutex;
 // Receive thread
 pthread_t receiveThread;
 // Log level filter. The server will only log messages with a level equal to or greater than this value.
 LOG_LEVEL g_logLevel = DEBUG;
+// Everytime we receive a message from a client we check if we have seen this client before, if not we add it to the list. We can then use this list to send messages to all clients.
+std::vector<struct sockaddr_in> g_clientList;
+
 
 // Signal handler for SIGINT
 void sigHandler(int sig) {
@@ -77,9 +82,6 @@ void* receiveThreadFunc(void* arg) {
 
     // run in an endless while loop via an is_running flag.
     while (g_isRunning) {
-        // apply mutexing to any shared resources used within the recvfrom() function.
-        pthread_mutex_lock(&g_mutex);
-
         char rcvBuffer[BUF_LEN];  // Buffer to hold the received data from the remote
         memset(rcvBuffer, 0, BUF_LEN);    // zero out the buffer.
 
@@ -89,13 +91,31 @@ void* receiveThreadFunc(void* arg) {
         // ensure the recvfrom() function is non-blocking with a sleep of 1 second if nothing is received.
         int recvlen = recvfrom(serverFd, rcvBuffer, BUF_LEN, MSG_DONTWAIT, (struct sockaddr *)&senderAddr, &addrlen);
         if (recvlen > 0) {  // if recvlen > 0, then data was received.
+            // apply mutexing to any shared resources used within the recvfrom() function.
+            pthread_mutex_lock(&g_mutex);
+
+            // check if we have seen this client before
+            bool seenBefore = false;
+            for (auto &clientAddr : g_clientList) {
+                if (clientAddr.sin_addr.s_addr == senderAddr.sin_addr.s_addr && clientAddr.sin_port == senderAddr.sin_port) {
+                    seenBefore = true;
+                    break;
+                }
+            }
+
+            // if this is a new client, add it to the client list
+            if (!seenBefore) {
+                g_clientList.push_back(senderAddr);
+            }
+
             // take any content from recvfrom() and write to the server log file.
             write(g_logFileFd, rcvBuffer, recvlen);
+
+            // unlock the mutex
+            pthread_mutex_unlock(&g_mutex);
         } else {
             sleep(1);   // sleep for 1 second if no data was received.
         }
-
-        pthread_mutex_unlock(&g_mutex); // unlock the mutex
     }
 
     // lock the mutex
@@ -113,30 +133,38 @@ int main() {
     signal(SIGINT, sigHandler);
 
     // Create UDP socket
-    g_serverFd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-    if (g_serverFd < 0) {
+    g_UDPSocketFD = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (g_UDPSocketFD < 0) {
         std::cerr << strerror(errno) << std::endl;
         return 1;
     }
 
     // Bind socket to IP address and available port
-    memset(&g_addr, 0, sizeof(g_addr)); // zero out the server struct.
-    g_addr.sin_family = AF_INET;    // set the address family to IPv4.
-    g_addr.sin_addr.s_addr = htonl(INADDR_ANY); // bind to any available IP address
-    g_addr.sin_port = htons(0);  // 0 = system chooses available port
-    if (bind(g_serverFd, (struct sockaddr *)&g_addr, sizeof(g_addr)) < 0) {
+    memset(&g_serverAddr, 0, sizeof(g_serverAddr)); // zero out the server struct.
+    g_serverAddr.sin_family = AF_INET;    // set the address family to IPv4.
+    g_serverAddr.sin_addr.s_addr = htonl(INADDR_ANY); // bind to any available IP address
+    g_serverAddr.sin_port =  htons(0);  // 0 = system chooses available port
+    if (bind(g_UDPSocketFD, (struct sockaddr *)&g_serverAddr, sizeof(g_serverAddr)) < 0) {
         std::cerr << strerror(errno) << std::endl;
         return 1;
     }
 
-    // Get the IP address and port assigned to our address struct, print and convert them to host byte order.
-    std::cout << "Server started on %s:%d" << inet_ntoa(g_addr.sin_addr) << ntohs(g_addr.sin_port) << std::endl;
+    // Get socket address information
+    struct sockaddr_in sin;
+    socklen_t len = sizeof(sin);
+    if (getsockname(g_UDPSocketFD, (struct sockaddr *)&sin, &len) == -1) {
+        std::cerr << "Error getting socket address information\n";
+        return 1;
+    }
+    std::cout << "Server listening on port " << ntohs(sin.sin_port) << std::endl;
+    std::cout << "Server listening on IP address " << inet_ntoa(sin.sin_addr) << std::endl;
+
 
     // Initialize mutex
     pthread_mutex_init(&g_mutex, NULL);
 
     // Start receive thread
-    pthread_create(&receiveThread, NULL, receiveThreadFunc, NULL);
+    pthread_create(&receiveThread, NULL, receiveThreadFunc, &g_UDPSocketFD);
 
     // User menu
     while (g_isRunning) {
@@ -145,17 +173,19 @@ int main() {
         std::cout << "2. Dump the log file here" << std::endl;
         std::cout << "0. Shut down" << std::endl;
         std::cout << "Enter your choice: ";
+
         int choice;
         std::cin >> choice;
+        std::cin.ignore();  // Ignore newline character
+
+        std::cout << "You entered: " << choice << std::endl;
         switch (choice) {
             case 1: {   // Set log level
-                std::cout << "0 = Debug" << std::endl;
-                std::cout << "1 = Warning" << std::endl;
-                std::cout << "2 = Error" << std::endl;
-                std::cout << "3 = Critical" << std::endl;
                 std::cout << "Enter log level (0-3): ";
+
                 int level;
                 std::cin >> level;
+                std::cin.ignore();  // Ignore newline character
 
                 if (level < 0 || level > 3) {
                     std::cerr << "Invalid log level" << std::endl;
@@ -168,43 +198,48 @@ int main() {
                 g_logLevel = (LOG_LEVEL)level;  // Set the log level
                 pthread_mutex_unlock(&g_mutex); // Unlock mutex
 
+                std::cout << "Log level set to " << level << std::endl;
+
                 // Send log level to anyone listening
                 char buf[BUF_LEN];  // Buffer to hold the message
                 memset(buf, 0, BUF_LEN);    // Zero out the buffer
                 int msgLength = sprintf(buf, "Set Log Level=%d", level) + 1; // Format the message and get the length
 
-                // Send the message
-                if (sendto(g_serverFd, buf, msgLength, 0, (struct sockaddr *) &g_addr, sizeof(g_addr)) < 0) {
-                    std::cerr << strerror(errno) << std::endl;
+                struct sockaddr_in clientAddr;
+                socklen_t addrLen = sizeof(clientAddr);
+                clientAddr.sin_family = AF_INET;
+                clientAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+                clientAddr.sin_port = htons(0);
+
+                // Send the message to all clients
+                for (auto &clientAddr : g_clientList) {
+                    if (sendto(g_UDPSocketFD, buf, msgLength, 0, (struct sockaddr *)&clientAddr, addrLen) < 0) {
+                        std::cerr << strerror(errno) << std::endl;
+                    }
                 }
 
                 break;
             }
             case 2: {   // Dump log file
                 // Open log file for read only
-                int dumpLogFile = open(LOG_FILE_PATH, O_RDONLY);
-                if (dumpLogFile < 0) {
+                FILE* dumpLogFile = fopen("server.log", "r");
+                if (dumpLogFile == NULL) {
                     std::cerr << strerror(errno) << std::endl;
                     break;
                 }
 
-                // print the contents of the log file to the console
-                char buf[BUF_LEN];  // Buffer to hold the message from the log file
-                memset(buf, 0, BUF_LEN);    // Zero out the buffer
-                int bytesRead = 0;  // Number of bytes read from the log file
-                while ((bytesRead = read(dumpLogFile, buf, BUF_LEN)) > 0) { // Read from the log file
-                    std::cout << buf;   // Print the message to the console
-                    memset(buf, 0, BUF_LEN); // Zero out the buffer
+                // Read the log file and print it to the screen
+                char buf[BUF_LEN];
+                while (fgets(buf, BUF_LEN, dumpLogFile) != NULL) {
+                    std::cout << buf;
                 }
-                std::cout << std::endl; // Print a newline character for formatting
 
                 // Close the log file
-                close(dumpLogFile);
+                fclose(dumpLogFile);
 
                 // Wait for user to press a key
                 std::cout << "Press any key to continue...";
-                std::cin.ignore();  // Ignore incoming newline character
-                std::cin.get();    // Wait for user to press a key
+                std::cin.get(); // Wait for user to press a key
                 break;
             }
             case 0: {   // Shut down
@@ -226,7 +261,7 @@ int main() {
     pthread_join(receiveThread, NULL);
 
     // Close the socket
-    close(g_serverFd);
+    close(g_UDPSocketFD);
 
     // Destroy mutex
     pthread_mutex_destroy(&g_mutex);
