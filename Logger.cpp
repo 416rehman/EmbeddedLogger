@@ -7,6 +7,9 @@
 #include <iostream>
 #include <unistd.h>
 #include "Logger.h"
+// Statics
+// Buffer size for the messages
+#define BUF_LEN 1024
 
 // global variable to hold the mutex used by this logger to protect any shared resources.
 pthread_mutex_t g_mutex;
@@ -15,7 +18,7 @@ pthread_t g_receive_thread_id;
 // Holds the address of the server to send the logs to.
 struct sockaddr_in g_server{};
 // Holds the file descriptor of the socket used to send the logs to the server.
-int g_fd = -1;
+int g_serverFd = -1;
 // global flag to indicate if the logger is running.
 bool g_is_running = true;
 // global variable to hold the log level filter for the logger. All messages with a level less than this will be ignored and not logged to the server.
@@ -33,17 +36,14 @@ void* ReceiveThread(void* arg) {
     // Get the file descriptor from the argument.
     int fd = *(int*)arg;
 
-    // Set the receive timeout to 1 second.
-    struct timeval tv{};    // create the time value struct
-    tv.tv_sec = 1;        // set the seconds to 1
-    tv.tv_usec = 0;       // set the microseconds to 0
-    // Set the Receive Timeout to the time value struct we just created.
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+    // We do not need to set a timeout for the socket since we are using the MSG_DONTWAIT flag in the recvfrom() function.
+    // This will make the recvfrom() function return immediately if there is no data to receive.
+    // Thus we can use a sleep of 1 second at the end of the loop instead of a timeout.
 
     // Run in an endless loop.
     while (g_is_running) {
         // Receive the command from the server.
-        char buffer[256];   // Buffer to hold the command (max size is 256 bytes).
+        char buffer[BUF_LEN];   // Buffer to hold the command (max size is BUF_LEN bytes).
         struct sockaddr_in sender;  // socket address struct to hold the address of the sender. (in this case the server).
         socklen_t server_len = sizeof(sender);  // The size of the sender struct.
         // Receive the command from the server. This will modify the server struct to hold the address of the server.
@@ -70,6 +70,9 @@ void* ReceiveThread(void* arg) {
                 pthread_mutex_unlock(&g_mutex);
             }
         }
+
+        // Sleep for 1 second.
+        sleep(1);
     }
 
     return nullptr;
@@ -100,17 +103,17 @@ int InitializeLog(const char* ip, int port) {
     pthread_mutex_lock(&g_mutex);
 
     // Check if the logger is already initialized.
-    if (g_fd > 0) { // if the file descriptor is greater than 0, then the logger is already initialized and we should not initialize it again.
+    if (g_serverFd > 0) { // if the file descriptor is greater than 0, then the logger is already initialized and we should not initialize it again.
         std::cerr << "Logger is already initialized on %s:%d" << inet_ntoa(g_server.sin_addr) << ntohs(g_server.sin_port) << std::endl;
         pthread_mutex_unlock(&g_mutex); // Unlock the mutex since we are done accessing shared resources.
         return -1;  // return -1 to indicate an error.
     }
 
     // Create a socket for UDP communications.
-    g_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    g_serverFd = socket(AF_INET, SOCK_DGRAM, 0);
 
     // Check if the socket was created successfully.
-    if (g_fd < 0) { // if the file descriptor returned is less than 0, then the socket was not created successfully.
+    if (g_serverFd < 0) { // if the file descriptor returned is less than 0, then the socket was not created successfully.
         perror("Error creating socket");    // print our own error message.
         std::cerr << strerror(errno) << std::endl;  // print the actual error message.
         pthread_mutex_unlock(&g_mutex); // Unlock the mutex since we are done accessing shared resources.
@@ -118,6 +121,7 @@ int InitializeLog(const char* ip, int port) {
     }
 
     // Set the address and port of the server.;
+    memset(&g_server, 0, sizeof(g_server));  // zero out the server struct.
     g_server.sin_family = AF_INET;  // set the address family to IPv4.
     g_server.sin_port = htons(port);    // convert the port to network byte order and set it.
     g_server.sin_addr.s_addr = inet_addr(ip);   // convert the IP address to network byte order and set it.
@@ -126,7 +130,7 @@ int InitializeLog(const char* ip, int port) {
     pthread_mutex_unlock(&g_mutex);
 
     // Start the receive thread and pass the file descriptor to it.
-    if (pthread_create(&g_receive_thread_id, NULL, ReceiveThread, &g_fd) != 0) {
+    if (pthread_create(&g_receive_thread_id, NULL, ReceiveThread, &g_serverFd) != 0) {
         perror("Error creating thread");    // print our own error message.
         std::cerr << strerror(errno) << std::endl;  // print the actual error message.
         return -1;  // return -1 to indicate an error.
@@ -176,7 +180,7 @@ void Log(LOG_LEVEL level, const char *prog, const char *func, int line, const ch
     char *dt = ctime(&now);
 
     // Create the log message.
-    char buf[256];  // create a buffer to hold the log message. The buffer will be 256 bytes long.
+    char buf[BUF_LEN];  // create a buffer to hold the log message. The buffer will be BUF_LEN bytes long.
     // an array of strings to convert the passed in log level to a string representation.
     char levelStr[][16]={"DEBUG", "WARNING", "ERROR", "CRITICAL"};
     // create the log message and store it in the buffer.
@@ -185,7 +189,7 @@ void Log(LOG_LEVEL level, const char *prog, const char *func, int line, const ch
     buf[len-1]='\0';
 
     // Send the log message to the server.
-    sendto(g_fd, buf, len, 0, (struct sockaddr *)&g_server, sizeof(g_server));
+    sendto(g_serverFd, buf, len, 0, (struct sockaddr *)&g_server, sizeof(g_server));
 
     // Unlock the mutex. We are done accessing the file descriptor.
     pthread_mutex_unlock(&g_mutex);
@@ -196,7 +200,7 @@ void ExitLog() {
     pthread_mutex_lock(&g_mutex);
 
     // Close the socket.
-    close(g_fd);
+    close(g_serverFd);
 
     // Unlock the mutex. We are done accessing the file descriptor.
     pthread_mutex_unlock(&g_mutex);
