@@ -20,7 +20,6 @@ typedef enum LOG_LEVEL
  * @return
  */
 int InitializeLog(const char* server_ip, int server_port);
-int InitializeLog();
 
 /**
  * Sets the log level.
